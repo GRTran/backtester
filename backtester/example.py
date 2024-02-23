@@ -29,6 +29,5 @@ def strat2(data, context):
 
 model = Engine(1000, data, strat2, context=1)
 model.run()
-print(model.cash)
 plt.plot(model.data.index, model.cash)
 plt.savefig("result.png")

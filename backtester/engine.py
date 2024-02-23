@@ -32,6 +32,10 @@ class Engine:
         context=None,
     ):
         self.data = timeseries
+        # Construct numpy arrays from the dataframe for access speeds
+        self.opens = self.data["Open"].values
+        self.closes = self.data["Adj Close"].values
+
         self.cash = np.zeros(len(timeseries))
         self.cash[0] = initial_amount
         self.strategy = user_strategy
@@ -89,7 +93,7 @@ class Engine:
         # Close position and add to history
         for i_ticker in range(len(self.tickers)):
             if self.trades.open_trade(i_ticker):
-                close = self.data["Adj Close"].loc[i, self.tickers[i_ticker]]
+                close = self.closes[i, i_ticker]
                 pnl = (close - self.trades.price[i_ticker]) * self.trades.shares[
                     i_ticker
                 ]
@@ -139,7 +143,7 @@ class Engine:
         # The total value of each position in the universe
         value = (alphas / total) * available_cash
         # Number of shares is then the value / closing price of the day.
-        nshares = value / self.data.loc[i, "Adj Close"]
+        nshares = value / self.closes[i, :]
         # Create the orders
         self.orders = nshares
         # self.orders += [Order(tick, share) for tick, share in zip(self.tickers, nshares)]
@@ -167,7 +171,7 @@ class Engine:
 
         # Convert orders at previous day's closing to trades using todays open price
         for i_ticker, order in enumerate(self.orders):
-            open_price = self.data["Open"].loc[i + 1, self.tickers[i_ticker]]
+            open_price = self.opens[i + 1, i_ticker]
             # if order.eligible(open_price, self.cash):
             if eligible(order, open_price, self.cash[i + 1]):
                 # Place the trade and reduce available cash in the account
