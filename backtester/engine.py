@@ -8,6 +8,7 @@ There will be a
 from typing import Iterable
 from datetime import datetime
 from dataclasses import dataclass
+import logging
 import pandas as pd
 import numpy as np
 
@@ -31,7 +32,8 @@ class Engine:
         context=None,
     ):
         self.data = timeseries
-        self.cash = initial_amount
+        self.cash = np.zeros(len(timeseries))
+        self.cash[0] = initial_amount
         self.strategy = user_strategy
         self.context = context
         self.pos_id = 0
@@ -40,8 +42,13 @@ class Engine:
         )
         # Vector tickers, with orders and trades in order of shown tickers
         self.tickers = [ticker for ticker in self.data["Adj Close"].columns]
-        self.trades = []
-        self.orders = []
+        # Order vector contains number of shares to be traded
+        self.orders = np.zeros(len(self.tickers))
+        # self.trades = np.zeros(len(self.tickers))
+        self.trades = Trade(len(self.tickers))
+
+        # Data capture
+        self.out_cash = np.zeros(len(timeseries))
 
     def run(self):
         """Execute the backtester.
@@ -51,28 +58,46 @@ class Engine:
         At each timestep we are doing actions for i-1-th closing and for i-th day opening.
         In practice, these actions would occur at different times but for backtesting it is
         sufficient for them to occur together.
+
+        The positions are closed at the end of the trading day. Orders are also placed at the
+        same time. Then positions are opened on the morning of the next trading day
         """
         for i in range(len(self.data)):
-
+            logging.debug(f"Progress: {i/len(self.data)*100.:.2f}%")
+            # Evening of i-th day
             # Close-out previous positions and adjust cash
             self._close_positions(i)
-            # Use closing price to create orders of day i-1
+            # Store output data
+            # self._store_outputs(i)
+            # Use closing price of the i-th day
             self._place_orders(i)
-            # Use opening price of day i to open trades
+            # Morning of i+1-th day
             self._place_trades(i)
 
         # Model is now complete, run a post-processer
 
-    def _close_positions(self, i) -> None:
+    def _close_positions(self, i: int) -> None:
+        """Goes through all positions and closes them out.
+
+        The positions are closed at the end of the trading day, using the i-th
+        datapoint.
+
+
+        Args:
+            i (int): The current time period index.
+        """
         # Close position and add to history
-        for trade in self.trades:
-            close = self.data["Adj Close"].loc[i - 1, trade.ticker]
-            pnl = (close - trade.price) * trade.shares
-            # Adjust cash by value of trade with and PnL generated
-            self.cash += abs(trade.value) + pnl
-            self.history.loc[trade.id, ["close_price", "PnL"]] = [close, pnl]
+        for i_ticker in range(len(self.tickers)):
+            if self.trades.open_trade(i_ticker):
+                close = self.data["Adj Close"].loc[i, self.tickers[i_ticker]]
+                pnl = (close - self.trades.price[i_ticker]) * self.trades.shares[
+                    i_ticker
+                ]
+                # Adjust cash by value of trade with and PnL generated
+                self.cash[i] += abs(self.trades.value(i_ticker)) + pnl
+                # self.history.loc[self.trades.id[i], ["close_price", "PnL"]] = [close, pnl]
         # Closing out
-        self.trades = []
+        self.trades.clear()
 
     def _place_orders(self, i: int) -> None:
         """Use the user supplied strategy to create alpha signals which are used to
@@ -91,11 +116,8 @@ class Engine:
             StrategyException: An error in how the strategy has been implemented is
              detected.
         """
-        if i == 0:
-            return
-
         # Can't place orders on first data entry point because we do not have previous day's close
-        alphas = self.strategy(self.data.loc[: i - 1, :], self.context)
+        alphas = self.strategy(self.data.loc[:i, :], self.context)
 
         # Perform some checks on the user response to make sure it satisfies requirements
         if not isinstance(alphas, Iterable) or len(alphas) != len(self.tickers):
@@ -112,18 +134,19 @@ class Engine:
         # Total alpha
         total = np.sum(np.abs(alphas))
         # Adjust available cash if there must be a minimum in cash account
-        available_cash = self.cash
+        available_cash = self.cash[i]
 
         # The total value of each position in the universe
         value = (alphas / total) * available_cash
-        # Number of shares is then the value / closing price of the previous day.
-        nshares = value / self.data.loc[i - 1, "Adj Close"]
+        # Number of shares is then the value / closing price of the day.
+        nshares = value / self.data.loc[i, "Adj Close"]
         # Create the orders
-        self.orders = [Order(tick, share) for tick, share in zip(self.tickers, nshares)]
+        self.orders = nshares
+        # self.orders += [Order(tick, share) for tick, share in zip(self.tickers, nshares)]
 
     def _place_trades(self, i: int) -> None:
         """Goes through all orders and attempts to place the trade using the open price
-        for the trading day.
+        for the next morning, i.e. i+1-th day.
 
         An eligibility check is performed to ensure that there is sufficient capital to
         place a trade. If there are numerous overnight changes in stock price, some
@@ -136,59 +159,110 @@ class Engine:
         Args:
             i (int): The current time period index.
         """
+        # Move cash over to next morning if there is a next morning
+        if len(self.cash) == i + 1:
+            return
+        else:
+            self.cash[i + 1] = self.cash[i]
+
         # Convert orders at previous day's closing to trades using todays open price
-        for order in self.orders:
-            open_price = self.data["Open"].loc[i, order.ticker]
-            if order.eligible(open_price, self.cash):
+        for i_ticker, order in enumerate(self.orders):
+            open_price = self.data["Open"].loc[i + 1, self.tickers[i_ticker]]
+            # if order.eligible(open_price, self.cash):
+            if eligible(order, open_price, self.cash[i + 1]):
                 # Place the trade and reduce available cash in the account
-                t = Trade(self.pos_id, order.ticker, open_price, order.shares)
-                self.trades += [t]
-                self.cash -= abs(t.value)
+                self.trades.id[i_ticker] = self.pos_id
+                self.trades.price[i_ticker] = open_price
+                self.trades.shares[i_ticker] = order
+                self.cash[i + 1] -= abs(self.trades.value(i_ticker))
                 # Add open trade to trade history
-                self.history.loc[self.pos_id] = [
-                    t.ticker,
-                    t.price,
-                    t.shares,
-                    None,
-                    None,
-                ]
+                # self.history.loc[self.pos_id] = [
+                #     t.ticker,
+                #     t.price,
+                #     t.shares,
+                #     None,
+                #     None,
+                # ]
                 # increment trade counter
                 self.pos_id += 1
 
-
-@dataclass
-class Trade:
-    id: int
-    ticker: str
-    price: float
-    shares: float
-
-    @property
-    def value(self):
-        return self.price * self.shares
-
-
-@dataclass
-class Order:
-    ticker: str
-    shares: float
-
-    def eligible(self, price: float, cash: float) -> bool:
-        """Checks whether the order can be placed.
-
-        When trying to long a position, we need enough cash. When trying to short,
-        we also need to make sure that we have enough cash for it.
-
-        TODO: This doesn't check open positions, and so all open positions must be
-         closed out after each period (fine when ignoring any transaction fees).
+    def _store_outputs(self, i: int) -> None:
+        """Store required outputs used for post-processing.
 
         Args:
-          name (str): The reference name of the universe file to be loaded.
+            i (int): The current time period index.
+        """
+        # The i-th time p
+        self.out_cash[i] = self.cash
+
+
+class Trade:
+
+    def __init__(self, universe_size: int) -> None:
+        self.id = np.zeros(universe_size)
+        self.price = np.zeros(universe_size)
+        self.shares = np.zeros(universe_size)
+
+    def value(self, i: int):
+        return self.price[i] * self.shares[i]
+
+    def open_trade(self, i: int) -> bool:
+        """Checks whether the shares are non-zero to see if a trade is open.
+
+        Args:
+            i (int): The ticker index.
 
         Returns:
-          pd.DataFrame: The universe of securities.
+            bool: True if trade is open and False otherwise.
         """
-        return abs(self.shares * price) <= cash
+        return abs(self.shares[i]) > 1e-6
+
+    def clear(self):
+        """Clear all trade entries."""
+        self.id[:] = 0.0
+        self.price[:] = 0.0
+        self.shares[:] = 0.0
+
+
+def eligible(shares: float, price: float, cash: float) -> bool:
+    """Checks whether the order can be placed.
+
+    When trying to long a position, we need enough cash. When trying to short,
+    we also need to make sure that we have enough cash for it.
+
+    TODO: This doesn't check open positions, and so all open positions must be
+     closed out after each period (fine when ignoring any transaction fees).
+
+    Args:
+      name (str): The reference name of the universe file to be loaded.
+
+    Returns:
+      pd.DataFrame: The universe of securities.
+    """
+    return abs(shares * price) <= cash
+
+
+# @dataclass
+# class Order:
+#     ticker: str
+#     shares: float
+
+#     def eligible(self, price: float, cash: float) -> bool:
+#         """Checks whether the order can be placed.
+
+#         When trying to long a position, we need enough cash. When trying to short,
+#         we also need to make sure that we have enough cash for it.
+
+#         TODO: This doesn't check open positions, and so all open positions must be
+#          closed out after each period (fine when ignoring any transaction fees).
+
+#         Args:
+#           name (str): The reference name of the universe file to be loaded.
+
+#         Returns:
+#           pd.DataFrame: The universe of securities.
+#         """
+#         return abs(self.shares * price) <= cash
 
 
 class StrategyException(Exception):
